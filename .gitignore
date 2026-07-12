@@ -1,0 +1,16 @@
+# Python cache and virtual environments
+__pycache__/
+*.py[cod]
+.venv/
+
+# Local app data. Do not commit saved accounts, emails, vault data, or inbox files.
+secure_share.db
+secure_share.db-journal
+*.db
+*.db-journal
+
+# Local test and scratch output
+.self_test_runs/
+.codex_tmp/
+sqlite_probe*.db
+sqlite_probe*.db-journal
