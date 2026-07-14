@@ -50,6 +50,8 @@ Files are encrypted on the client before upload. The server stores shared accoun
 
 The server can be hosted with Docker on a VPS or cloud server. The included `Dockerfile` and `compose.yaml` run only the backend server and store its database in a persistent Docker volume.
 
+Oracle Cloud Always Free is the recommended free-tier path for this prototype. The repo includes an Oracle setup script at `deploy/oracle-cloud-setup.sh`.
+
 Quick local Docker test:
 
 ```bash

@@ -27,6 +27,34 @@ Optional config:
 cp .env.example .env
 ```
 
+## Oracle Cloud Always Free Quick Start
+
+Oracle Cloud is a good free-tier option for this project because the backend only needs a small Linux VM, Docker, and persistent disk storage.
+
+Create the VM in Oracle Cloud:
+
+- Image: `Ubuntu 24.04` or newer
+- Shape: an Always Free eligible shape, such as Ampere A1 if available
+- Networking: assign a public IPv4 address
+- SSH: add your public SSH key during VM creation
+- Ingress rules: allow TCP `22` for SSH, then TCP `80` and `443` for HTTPS
+
+After the VM is running, SSH into it and run:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/shaunpaul51611/supersafe-internship/main/deploy/oracle-cloud-setup.sh | bash
+```
+
+That script installs Docker, clones this repo, starts the server container, and checks `/health`.
+
+If you want to test without a domain first, temporarily allow TCP `8000` in the Oracle Cloud subnet security list, then visit:
+
+```text
+http://YOUR_ORACLE_PUBLIC_IP:8000/health
+```
+
+For real use, prefer HTTPS on `80`/`443` with Caddy instead of exposing port `8000` publicly.
+
 ## 2. Start The Server
 
 ```bash
