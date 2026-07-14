@@ -11,10 +11,6 @@ secure_share_server.db-journal
 *.db
 *.db-journal
 
-# Local environment overrides
-.env
-.env.local
-
 # Local test and scratch output
 .self_test_runs/
 .codex_tmp/

@@ -13,6 +13,8 @@ A Python desktop prototype for secure sign-in, friend requests, and encrypted fi
 
 ## Local Desktop Mode
 
+This runs everything on one computer with a local app database.
+
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
@@ -27,9 +29,9 @@ python -m pip install -r requirements.txt
 python secure_share_app.py
 ```
 
-## Server Mode
+## Host From Your Computer
 
-For cross-device transfer, run the server on one machine:
+For cross-device transfer without cloud hosting, run the server on your computer:
 
 ```powershell
 $env:SECURE_SHARE_HOST="0.0.0.0"
@@ -37,29 +39,16 @@ $env:SECURE_SHARE_PORT="8000"
 python secure_share_server.py
 ```
 
-Then run the desktop app on each device with the same server URL:
+Then run the desktop app on each device with your computer's local network IP address:
 
 ```powershell
-$env:SECURE_SHARE_SERVER_URL="http://SERVER_IP_ADDRESS:8000"
+$env:SECURE_SHARE_SERVER_URL="http://YOUR_COMPUTER_IP:8000"
 python secure_share_app.py
 ```
 
-Files are encrypted on the client before upload. The server stores shared accounts, friend requests, public keys, encrypted file blobs, and inbox metadata so different devices can see the same transfers.
+The server stays online only while your computer is powered on, awake, connected to the network, and the server window is still running. You may also need to allow Python or `SecureShareServer.exe` through Windows Firewall.
 
-## Cloud Deployment
-
-The server can be hosted with Docker on a VPS or cloud server. The included `Dockerfile` and `compose.yaml` run only the backend server and store its database in a persistent Docker volume.
-
-Oracle Cloud Always Free is the recommended free-tier path for this prototype. The repo includes an Oracle setup script at `deploy/oracle-cloud-setup.sh`.
-
-Quick local Docker test:
-
-```bash
-docker compose up -d --build
-curl http://127.0.0.1:8000/health
-```
-
-For a full cloud setup with HTTPS and update workflow, see [DEPLOYMENT.md](DEPLOYMENT.md).
+Files are encrypted on the client before upload. The server running on your computer stores shared accounts, friend requests, public keys, encrypted file blobs, and inbox metadata so devices on your network can see the same transfers.
 
 ## Built-In Tests
 
@@ -72,4 +61,4 @@ The reserved test username is `__secure_echo__`. Normal users cannot register or
 
 ## Notes
 
-This is a strong learning prototype, not an audited production security product. For real deployment, keep the server behind HTTPS and add device/key verification, rate limiting, audit logging, backups, and a recovery design for lost master passwords.
+This is a strong learning prototype, not an audited production security product. Keep it on a trusted local network unless you add HTTPS, stronger abuse protection, audit logging, backups, and device/key verification.

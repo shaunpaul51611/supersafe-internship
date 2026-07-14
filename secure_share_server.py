@@ -22,26 +22,9 @@ def get_app_dir() -> Path:
     return Path(__file__).resolve().parent
 
 
-def get_server_db_path() -> Path:
-    explicit_path = os.getenv("SECURE_SHARE_DB_PATH", "").strip()
-    if explicit_path:
-        return Path(explicit_path).expanduser().resolve()
-
-    data_dir = os.getenv("SECURE_SHARE_DATA_DIR", "").strip()
-    if data_dir:
-        return Path(data_dir).expanduser().resolve() / "secure_share_server.db"
-
-    return APP_DIR / "secure_share_server.db"
-
-
-def get_max_request_bytes() -> int:
-    max_mb = int(os.getenv("SECURE_SHARE_MAX_REQUEST_MB", "100"))
-    return max(1, max_mb) * 1024 * 1024
-
-
 APP_DIR = get_app_dir()
-SERVER_DB_PATH = get_server_db_path()
-MAX_REQUEST_BYTES = get_max_request_bytes()
+SERVER_DB_PATH = APP_DIR / "secure_share_server.db"
+MAX_REQUEST_BYTES = 100 * 1024 * 1024
 
 USERNAME_RE = re.compile(r"^[a-zA-Z0-9_.-]{3,32}$")
 EMAIL_RE = re.compile(r"^[^@\s]{1,64}@[^@\s]{1,255}\.[^@\s]{2,24}$")
