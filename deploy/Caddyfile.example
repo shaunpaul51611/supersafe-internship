@@ -1,0 +1,5 @@
+# Replace secure-share.example.com with your real domain.
+# Caddy automatically requests and renews HTTPS certificates.
+secure-share.example.com {
+    reverse_proxy 127.0.0.1:8000
+}

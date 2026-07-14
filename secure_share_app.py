@@ -7,6 +7,9 @@ import json
 import os
 import re
 import sqlite3
+import sys
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -39,8 +42,15 @@ except Exception as exc:  # pragma: no cover - used for a friendly runtime error
     CRYPTO_IMPORT_ERROR = exc
 
 
-APP_DIR = Path(__file__).resolve().parent
+def get_app_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+APP_DIR = get_app_dir()
 DB_PATH = APP_DIR / "secure_share.db"
+SERVER_URL = os.getenv("SECURE_SHARE_SERVER_URL", "").strip().rstrip("/")
 
 USERNAME_RE = re.compile(r"^[a-zA-Z0-9_.-]{3,32}$")
 EMAIL_RE = re.compile(r"^[^@\s]{1,64}@[^@\s]{1,255}\.[^@\s]{2,24}$")
@@ -64,6 +74,22 @@ def b64(data: bytes) -> str:
 
 def from_b64(data: str) -> bytes:
     return base64.urlsafe_b64decode(data.encode("ascii"))
+
+
+def encode_bytes_map(payload: dict, keys: list[str]) -> dict:
+    encoded = dict(payload)
+    for key in keys:
+        if key in encoded and isinstance(encoded[key], bytes):
+            encoded[key] = b64(encoded[key])
+    return encoded
+
+
+def decode_bytes_map(payload: dict, keys: list[str]) -> dict:
+    decoded = dict(payload)
+    for key in keys:
+        if key in decoded and isinstance(decoded[key], str):
+            decoded[key] = from_b64(decoded[key])
+    return decoded
 
 
 def require_crypto() -> None:
@@ -155,6 +181,64 @@ def derive_file_wrap_key(shared_secret: bytes, salt: bytes, sender: str, recipie
 
 def crypto_label() -> str:
     return "ML-KEM-768 (CRYSTALS-Kyber) + AES-256-GCM"
+
+
+TRANSFER_BYTE_FIELDS = [
+    "file_nonce",
+    "file_ciphertext",
+    "kem_ciphertext",
+    "wrap_salt",
+    "wrap_nonce",
+    "wrapped_file_key",
+]
+
+USER_KEY_FIELDS = [
+    "password_salt",
+    "password_verifier",
+    "kem_public_key",
+    "kem_secret_key_nonce",
+    "kem_secret_key_ciphertext",
+]
+
+
+def build_encrypted_file_transfer(
+    sender_username: str,
+    recipient: dict | sqlite3.Row,
+    original_name: str,
+    file_data: bytes,
+) -> dict:
+    require_crypto()
+    recipient_username = recipient["username"]
+    file_key = os.urandom(32)
+    file_aad = (
+        f"secure-share-file-v1|{sender_username.lower()}|"
+        f"{recipient_username.lower()}|{original_name}"
+    ).encode("utf-8")
+    file_nonce, file_ciphertext = aes_encrypt(file_key, file_data, file_aad)
+
+    kem_ciphertext, shared_secret = ml_kem_768.encrypt(recipient["kem_public_key"])
+    wrap_salt = os.urandom(16)
+    wrap_key = derive_file_wrap_key(
+        shared_secret,
+        wrap_salt,
+        sender_username,
+        recipient_username,
+    )
+    wrap_aad = (
+        f"secure-share-wrap-v1|{sender_username.lower()}|"
+        f"{recipient_username.lower()}|{original_name}"
+    ).encode("utf-8")
+    wrap_nonce, wrapped_file_key = aes_encrypt(wrap_key, file_key, wrap_aad)
+    return {
+        "original_name": original_name,
+        "file_size": len(file_data),
+        "file_nonce": file_nonce,
+        "file_ciphertext": file_ciphertext,
+        "kem_ciphertext": kem_ciphertext,
+        "wrap_salt": wrap_salt,
+        "wrap_nonce": wrap_nonce,
+        "wrapped_file_key": wrapped_file_key,
+    }
 
 
 @dataclass
@@ -589,26 +673,12 @@ class SecureStore:
         if not self.are_friends(sender.id, recipient_id):
             raise ValueError("Files can only be shared with accepted friends.")
 
-        file_key = os.urandom(32)
-        file_aad = (
-            f"secure-share-file-v1|{sender.username.lower()}|"
-            f"{recipient['username'].lower()}|{original_name}"
-        ).encode("utf-8")
-        file_nonce, file_ciphertext = aes_encrypt(file_key, file_data, file_aad)
-
-        kem_ciphertext, shared_secret = ml_kem_768.encrypt(recipient["kem_public_key"])
-        wrap_salt = os.urandom(16)
-        wrap_key = derive_file_wrap_key(
-            shared_secret,
-            wrap_salt,
+        transfer = build_encrypted_file_transfer(
             sender.username,
-            recipient["username"],
+            recipient,
+            original_name,
+            file_data,
         )
-        wrap_aad = (
-            f"secure-share-wrap-v1|{sender.username.lower()}|"
-            f"{recipient['username'].lower()}|{original_name}"
-        ).encode("utf-8")
-        wrap_nonce, wrapped_file_key = aes_encrypt(wrap_key, file_key, wrap_aad)
 
         with self.conn:
             cur = self.conn.execute(
@@ -623,14 +693,14 @@ class SecureStore:
                 (
                     sender.id,
                     recipient_id,
-                    original_name,
-                    len(file_data),
-                    file_nonce,
-                    file_ciphertext,
-                    kem_ciphertext,
-                    wrap_salt,
-                    wrap_nonce,
-                    wrapped_file_key,
+                    transfer["original_name"],
+                    transfer["file_size"],
+                    transfer["file_nonce"],
+                    transfer["file_ciphertext"],
+                    transfer["kem_ciphertext"],
+                    transfer["wrap_salt"],
+                    transfer["wrap_nonce"],
+                    transfer["wrapped_file_key"],
                     utc_now(),
                 ),
             )
@@ -761,13 +831,310 @@ class SecureStore:
         return transfer["original_name"], plaintext
 
 
+class RemoteSecureStore:
+    def __init__(self, base_url: str) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.session_token: str | None = None
+        self.mode_label = f"Server: {self.base_url}"
+        self._request("GET", "/health", auth=False)
+
+    def close(self) -> None:
+        return
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        payload: dict | None = None,
+        auth: bool = True,
+    ) -> dict | list:
+        data = None
+        headers = {"Accept": "application/json"}
+        if payload is not None:
+            data = json.dumps(payload).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        if auth:
+            if not self.session_token:
+                raise ValueError("Sign in before using the server.")
+            headers["Authorization"] = f"Bearer {self.session_token}"
+        request = urllib.request.Request(
+            f"{self.base_url}{path}",
+            data=data,
+            headers=headers,
+            method=method,
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                raw = response.read()
+        except urllib.error.HTTPError as exc:
+            raw = exc.read()
+            try:
+                detail = json.loads(raw.decode("utf-8")).get("error", exc.reason)
+            except Exception:
+                detail = exc.reason
+            raise ValueError(detail) from exc
+        except urllib.error.URLError as exc:
+            raise ValueError(f"Could not reach Secure Share server: {exc.reason}") from exc
+        if not raw:
+            return {}
+        return json.loads(raw.decode("utf-8"))
+
+    def create_user(self, username: str, email: str, password: str) -> CurrentUser:
+        require_crypto()
+        username = normalize_username(username)
+        email = normalize_email(email)
+        validate_username(username)
+        validate_email(email)
+        if len(password) < 10:
+            raise ValueError("Use a master password of at least 10 characters.")
+
+        auth_salt = os.urandom(16)
+        auth_key, vault_key = derive_user_keys(password, auth_salt)
+        verifier = password_verifier(username, auth_key)
+        kem_public_key, kem_secret_key = ml_kem_768.generate_keypair()
+        kem_nonce, kem_ciphertext = aes_encrypt(
+            vault_key,
+            kem_secret_key,
+            f"secure-share-kem-secret-v1:{username.lower()}".encode("utf-8"),
+        )
+        payload = encode_bytes_map(
+            {
+                "username": username,
+                "email": email,
+                "password_salt": auth_salt,
+                "password_verifier": verifier,
+                "kem_public_key": kem_public_key,
+                "kem_secret_key_nonce": kem_nonce,
+                "kem_secret_key_ciphertext": kem_ciphertext,
+            },
+            USER_KEY_FIELDS,
+        )
+        created = self._request("POST", "/users", payload, auth=False)
+        return CurrentUser(
+            id=created["id"],
+            username=username,
+            email=email,
+            vault_key=vault_key,
+            kem_public_key=kem_public_key,
+            kem_secret_key=kem_secret_key,
+        )
+
+    def authenticate_password(self, identifier: str, password: str) -> CurrentUser:
+        lookup = self._request(
+            "POST",
+            "/auth/lookup",
+            {"identifier": identifier.strip()},
+            auth=False,
+        )
+        username = lookup["username"]
+        auth_key, vault_key = derive_user_keys(password, from_b64(lookup["password_salt"]))
+        verifier = password_verifier(username, auth_key)
+        response = self._request(
+            "POST",
+            "/auth/login",
+            {
+                "identifier": identifier.strip(),
+                "password_verifier": b64(verifier),
+            },
+            auth=False,
+        )
+        self.session_token = response["session_token"]
+        user_row = decode_bytes_map(response["user"], USER_KEY_FIELDS)
+        aad = f"secure-share-kem-secret-v1:{user_row['username'].lower()}".encode("utf-8")
+        try:
+            kem_secret_key = aes_decrypt(
+                vault_key,
+                user_row["kem_secret_key_nonce"],
+                user_row["kem_secret_key_ciphertext"],
+                aad,
+            )
+        except InvalidTag as exc:
+            raise ValueError("Unable to unlock this account.") from exc
+        return CurrentUser(
+            id=user_row["id"],
+            username=user_row["username"],
+            email=user_row["email"] or "",
+            vault_key=vault_key,
+            kem_public_key=user_row["kem_public_key"],
+            kem_secret_key=kem_secret_key,
+        )
+
+    def get_user_by_id(self, user_id: int) -> dict:
+        return decode_bytes_map(
+            self._request("GET", f"/users/{user_id}"),
+            ["kem_public_key"],
+        )
+
+    def send_friend_request(self, requester_id: int, target_username: str) -> str:
+        response = self._request(
+            "POST",
+            "/friends/request",
+            {"target_username": normalize_username(target_username)},
+        )
+        return response["message"]
+
+    def respond_to_friend_request(self, request_id: int, user_id: int, status: str) -> None:
+        self._request(
+            "POST",
+            "/friends/respond",
+            {"request_id": request_id, "status": status},
+        )
+
+    def list_incoming_requests(self, user_id: int) -> list[dict]:
+        return self._request("GET", "/friends/incoming")
+
+    def list_outgoing_requests(self, user_id: int) -> list[dict]:
+        return self._request("GET", "/friends/outgoing")
+
+    def list_friends(self, user_id: int) -> list[dict]:
+        return [
+            decode_bytes_map(friend, ["kem_public_key"])
+            for friend in self._request("GET", "/friends")
+        ]
+
+    def are_friends(self, left_id: int, right_id: int) -> bool:
+        response = self._request("GET", f"/friends/check/{left_id}/{right_id}")
+        return bool(response["accepted"])
+
+    def add_vault_entry(self, user: CurrentUser, payload: dict) -> None:
+        raise ValueError("The password vault is disabled in server mode.")
+
+    def delete_vault_entry(self, user_id: int, entry_id: int) -> None:
+        return
+
+    def list_vault_entries(self, user_id: int) -> list[dict]:
+        return []
+
+    def create_file_transfer(
+        self,
+        sender: CurrentUser,
+        recipient_id: int,
+        source_path: Path,
+    ) -> int:
+        return self.create_file_transfer_bytes(
+            sender,
+            recipient_id,
+            source_path.name,
+            source_path.read_bytes(),
+        )
+
+    def create_file_transfer_bytes(
+        self,
+        sender: CurrentUser,
+        recipient_id: int,
+        original_name: str,
+        file_data: bytes,
+    ) -> int:
+        recipient = self.get_user_by_id(recipient_id)
+        if not self.are_friends(sender.id, recipient_id):
+            raise ValueError("Files can only be shared with accepted friends.")
+        transfer = build_encrypted_file_transfer(
+            sender.username,
+            recipient,
+            original_name,
+            file_data,
+        )
+        payload = encode_bytes_map(
+            {"recipient_id": recipient_id, **transfer},
+            TRANSFER_BYTE_FIELDS,
+        )
+        response = self._request("POST", "/files/send", payload)
+        return response["id"]
+
+    def ensure_echo_friendship(self, user_id: int) -> dict:
+        return decode_bytes_map(
+            self._request("POST", "/echo/friendship", {}),
+            ["kem_public_key"],
+        )
+
+    def run_echo_transfer_test(
+        self,
+        user: CurrentUser,
+        original_name: str = "secure-echo-test.txt",
+        file_data: bytes | None = None,
+    ) -> int:
+        echo = self.ensure_echo_friendship(user.id)
+        payload = file_data or (
+            f"Secure echo test for {user.username} at {utc_now()}\n"
+            f"Encryption: {crypto_label()}\n"
+        ).encode("utf-8")
+        self.create_file_transfer_bytes(
+            user,
+            echo["id"],
+            f"outbound-{original_name}",
+            payload,
+        )
+        recipient = {
+            "username": user.username,
+            "kem_public_key": user.kem_public_key,
+        }
+        transfer = build_encrypted_file_transfer(
+            echo["username"],
+            recipient,
+            f"echo-{original_name}",
+            payload,
+        )
+        response = self._request(
+            "POST",
+            "/echo/return",
+            encode_bytes_map(transfer, TRANSFER_BYTE_FIELDS),
+        )
+        return response["id"]
+
+    def list_received_files(self, user_id: int) -> list[dict]:
+        return self._request("GET", "/files/inbox")
+
+    def decrypt_received_file(self, user: CurrentUser, transfer_id: int) -> tuple[str, bytes]:
+        transfer = decode_bytes_map(
+            self._request("GET", f"/files/{transfer_id}"),
+            TRANSFER_BYTE_FIELDS,
+        )
+        shared_secret = ml_kem_768.decrypt(user.kem_secret_key, transfer["kem_ciphertext"])
+        wrap_key = derive_file_wrap_key(
+            shared_secret,
+            transfer["wrap_salt"],
+            transfer["sender_username"],
+            transfer["recipient_username"],
+        )
+        wrap_aad = (
+            f"secure-share-wrap-v1|{transfer['sender_username'].lower()}|"
+            f"{transfer['recipient_username'].lower()}|{transfer['original_name']}"
+        ).encode("utf-8")
+        file_key = aes_decrypt(
+            wrap_key,
+            transfer["wrap_nonce"],
+            transfer["wrapped_file_key"],
+            wrap_aad,
+        )
+        file_aad = (
+            f"secure-share-file-v1|{transfer['sender_username'].lower()}|"
+            f"{transfer['recipient_username'].lower()}|{transfer['original_name']}"
+        ).encode("utf-8")
+        plaintext = aes_decrypt(
+            file_key,
+            transfer["file_nonce"],
+            transfer["file_ciphertext"],
+            file_aad,
+        )
+        self._request("POST", f"/files/{transfer_id}/downloaded", {})
+        return transfer["original_name"], plaintext
+
+
+def make_store() -> SecureStore | RemoteSecureStore:
+    if SERVER_URL:
+        return RemoteSecureStore(SERVER_URL)
+    store = SecureStore()
+    store.mode_label = "Local prototype"
+    return store
+
+
 class SecureShareApp(Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("Quantum Safe Share")
         self.geometry("1120x760")
         self.minsize(980, 680)
-        self.store = SecureStore()
+        self.store = make_store()
         self.current_user: CurrentUser | None = None
         self.dark_mode = BooleanVar(value=True)
         self.current_view = "login"
@@ -972,6 +1339,8 @@ class SecureShareApp(Tk):
         subtitle = crypto_label()
         if self.current_user:
             subtitle = f"{self.current_user.email}  |  {crypto_label()}"
+        mode_label = getattr(self.store, "mode_label", "Local prototype")
+        subtitle = f"{subtitle}  |  {mode_label}"
         self.label(left, subtitle, size=10, muted=True).pack(anchor="w", pady=(4, 0))
         mode_text = "Light mode" if self.dark_mode.get() else "Dark mode"
         self.button(bar, mode_text, self.toggle_theme).pack(side=RIGHT, padx=(8, 0))
